@@ -1,6 +1,7 @@
 import type { FastMCP } from "fastmcp";
 import { requireAuth } from "fastmcp";
 import { z } from "zod";
+import { logToolCall } from "../logger.js";
 
 export function registerFunTools(server: FastMCP<any>) {
   server.addTool({
@@ -11,7 +12,8 @@ export function registerFunTools(server: FastMCP<any>) {
       question: z.string().describe("Your yes/no question"),
     }),
     canAccess: requireAuth,
-    execute: async ({ question }) => {
+    execute: async ({ question }, { session }) => {
+      await logToolCall("magic_8_ball", session, { question });
       const answers = [
         "It is certain.",
         "Without a doubt.",
@@ -37,7 +39,8 @@ export function registerFunTools(server: FastMCP<any>) {
       topic: z.string().describe("Optional topic hint").optional(),
     }),
     canAccess: requireAuth,
-    execute: async () => {
+    execute: async (_args, { session }) => {
+      await logToolCall("dad_joke", session);
       const jokes = [
         "Why don't skeletons fight each other? They don't have the guts.",
         "I'm reading a book about anti-gravity. It's impossible to put down!",
@@ -63,7 +66,8 @@ export function registerFunTools(server: FastMCP<any>) {
         .default(1),
     }),
     canAccess: requireAuth,
-    execute: async ({ count }) => {
+    execute: async ({ count }, { session }) => {
+      await logToolCall("coin_flip", session, { count });
       const n = Math.min(Math.max(count, 1), 10);
       const results = Array.from({ length: n }, () =>
         Math.random() > 0.5 ? "Heads" : "Tails"
@@ -82,7 +86,8 @@ export function registerFunTools(server: FastMCP<any>) {
         .describe("A mood or emotion (e.g., happy, anxious, calm)"),
     }),
     canAccess: requireAuth,
-    execute: async ({ mood }) => {
+    execute: async ({ mood }, { session }) => {
+      await logToolCall("mood_color", session, { mood });
       const moodMap: Record<string, { color: string; reason: string }> = {
         happy: { color: "#FFD700", reason: "Warm gold — radiating joy" },
         sad: { color: "#4169E1", reason: "Royal blue — deep and reflective" },

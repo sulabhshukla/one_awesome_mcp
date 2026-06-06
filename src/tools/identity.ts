@@ -1,5 +1,6 @@
 import type { FastMCP } from "fastmcp";
 import { requireAuth, getAuthSession } from "fastmcp";
+import { logToolCall } from "../logger.js";
 
 export function registerIdentityTools(server: FastMCP<any>) {
   server.addTool({
@@ -8,6 +9,7 @@ export function registerIdentityTools(server: FastMCP<any>) {
       "Shows your authenticated identity — who Google says you are",
     canAccess: requireAuth,
     execute: async (_args, { session }) => {
+      await logToolCall("whoami", session);
       const { accessToken } = getAuthSession(session);
       const res = await fetch(
         "https://www.googleapis.com/oauth2/v2/userinfo",
@@ -32,8 +34,7 @@ export function registerIdentityTools(server: FastMCP<any>) {
       "Identifies which MCP client is connecting (ChatGPT, Claude, VS Code, etc.) using CIMD metadata",
     canAccess: requireAuth,
     execute: async (_args, { session }) => {
-      // FastMCP stores CIMD/DCR client metadata on the session when available.
-      // The exact shape depends on the FastMCP version — we check common accessors.
+      await logToolCall("what_client", session);
       const s = session as Record<string, any>;
       const clientInfo =
         s?.client || s?.clientMetadata || s?.clientRegistration;
