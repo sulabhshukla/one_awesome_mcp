@@ -26,24 +26,83 @@ registerFunTools(server);
 registerIdentityTools(server);
 
 const port = parseInt(process.env.PORT || "3000", 10);
-
-// Debug proxy: log all OAuth/.well-known requests before forwarding to FastMCP
-const debugPort = port + 1;
+const fastmcpPort = port + 1;
 
 await server.start({
   transportType: "httpStream",
   httpStream: {
-    port: debugPort,
+    port: fastmcpPort,
     host: "0.0.0.0",
   },
 });
 
+/**
+ * Helper: forward a request to the FastMCP backend and return the response.
+ */
+function forwardRequest(
+  method: string,
+  path: string,
+  headers: http.IncomingHttpHeaders,
+  body?: Buffer
+): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer }> {
+  return new Promise((resolve, reject) => {
+    const proxyReq = http.request(
+      {
+        hostname: "127.0.0.1",
+        port: fastmcpPort,
+        path,
+        method,
+        headers: { ...headers },
+      },
+      (proxyRes) => {
+        const chunks: Buffer[] = [];
+        proxyRes.on("data", (chunk) => chunks.push(chunk));
+        proxyRes.on("end", () => {
+          resolve({
+            status: proxyRes.statusCode || 500,
+            headers: proxyRes.headers,
+            body: Buffer.concat(chunks),
+          });
+        });
+      }
+    );
+    proxyReq.on("error", reject);
+    if (body && body.length > 0) proxyReq.write(body);
+    proxyReq.end();
+  });
+}
+
+/**
+ * Auto-register a client via DCR before forwarding to /oauth/authorize.
+ * ChatGPT (and possibly other clients) skip the /oauth/register step,
+ * so we synthesize it when we see an unregistered redirect_uri.
+ */
+async function autoRegister(redirectUri: string, clientName?: string) {
+  const registerBody = JSON.stringify({
+    redirect_uris: [redirectUri],
+    client_name: clientName || "auto-registered",
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+    token_endpoint_auth_method: "client_secret_basic",
+  });
+
+  console.log(`[PROXY] Auto-registering redirect_uri: ${redirectUri}`);
+
+  const result = await forwardRequest("POST", "/oauth/register", {
+    "content-type": "application/json",
+    "content-length": String(Buffer.byteLength(registerBody)),
+  }, Buffer.from(registerBody));
+
+  console.log(`[PROXY] Registration response: ${result.status} ${result.body.toString()}`);
+  return result.status === 201;
+}
+
 const proxy = http.createServer((req, res) => {
   const url = new URL(req.url || "", `http://${req.headers.host}`);
-  const isDebug =
+  const isOAuth =
     url.pathname.includes("oauth") || url.pathname.includes(".well-known");
 
-  if (isDebug) {
+  if (isOAuth) {
     console.log(`\n[DEBUG] >>> ${req.method} ${req.url}`);
     console.log(`[DEBUG] User-Agent: ${req.headers["user-agent"]}`);
     for (const [k, v] of url.searchParams.entries()) {
@@ -51,63 +110,50 @@ const proxy = http.createServer((req, res) => {
     }
   }
 
-  // Collect request body for POST
   const chunks: Buffer[] = [];
   req.on("data", (chunk) => chunks.push(chunk));
-  req.on("end", () => {
+  req.on("end", async () => {
     const body = Buffer.concat(chunks);
-    if (isDebug && body.length > 0) {
+    if (isOAuth && body.length > 0) {
       console.log(`[DEBUG] POST body: ${body.toString()}`);
     }
 
-    // Forward to FastMCP
-    const proxyReq = http.request(
-      {
-        hostname: "127.0.0.1",
-        port: debugPort,
-        path: req.url,
-        method: req.method,
-        headers: { ...req.headers, host: req.headers.host },
-      },
-      (proxyRes) => {
-        if (isDebug) {
-          console.log(`[DEBUG] <<< ${proxyRes.statusCode}`);
-          if (proxyRes.headers.location) {
-            console.log(`[DEBUG] Location: ${proxyRes.headers.location}`);
-          }
-        }
-
-        // Collect response body for debug logging
-        if (isDebug) {
-          const resChunks: Buffer[] = [];
-          proxyRes.on("data", (chunk) => resChunks.push(chunk));
-          proxyRes.on("end", () => {
-            const resBody = Buffer.concat(resChunks).toString();
-            if (resBody) {
-              console.log(`[DEBUG] Response body: ${resBody}`);
-            }
-            res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
-            res.end(Buffer.concat(resChunks));
-          });
-        } else {
-          res.writeHead(proxyRes.statusCode || 500, proxyRes.headers);
-          proxyRes.pipe(res);
+    try {
+      // If this is /oauth/authorize and has a redirect_uri, auto-register first
+      if (req.method === "GET" && url.pathname === "/oauth/authorize") {
+        const redirectUri = url.searchParams.get("redirect_uri");
+        if (redirectUri) {
+          await autoRegister(redirectUri);
         }
       }
-    );
 
-    proxyReq.on("error", (err) => {
-      console.error(`[DEBUG] Proxy error: ${err.message}`);
+      const result = await forwardRequest(
+        req.method || "GET",
+        req.url || "/",
+        req.headers,
+        body
+      );
+
+      if (isOAuth) {
+        console.log(`[DEBUG] <<< ${result.status}`);
+        if (result.headers.location) {
+          console.log(`[DEBUG] Location: ${result.headers.location}`);
+        }
+        const resBody = result.body.toString();
+        if (resBody) {
+          console.log(`[DEBUG] Response body: ${resBody}`);
+        }
+      }
+
+      res.writeHead(result.status, result.headers);
+      res.end(result.body);
+    } catch (err: any) {
+      console.error(`[PROXY] Error: ${err.message}`);
       res.writeHead(502).end("Bad Gateway");
-    });
-
-    if (body.length > 0) {
-      proxyReq.write(body);
     }
-    proxyReq.end();
   });
 });
 
 proxy.listen(port, "0.0.0.0", () => {
-  console.log(`Debug proxy on port ${port}, FastMCP on port ${debugPort}`);
+  console.log(`Proxy on port ${port}, FastMCP on port ${fastmcpPort}`);
 });
