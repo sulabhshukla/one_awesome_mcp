@@ -16,7 +16,7 @@
   "license": "ISC",
   "description": "MCP server with CIMD client identification and Google OAuth",
   "dependencies": {
-    "fastmcp": "^4.0.1",
+    "fastmcp": "4.0.1",
     "zod": "^4.4.3"
   },
   "devDependencies": {
