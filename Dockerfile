@@ -1,15 +1,7 @@
-FROM node:22-slim AS builder
+FROM python:3.12-slim
 WORKDIR /app
-COPY package*.json ./
-RUN npm install
-COPY tsconfig.json ./
-COPY src/ ./src/
-RUN npm run build
-
-FROM node:22-slim
-WORKDIR /app
-COPY package*.json ./
-RUN npm install --omit=dev
-COPY --from=builder /app/dist ./dist
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY server.py .
 EXPOSE 3000
-CMD ["node", "dist/server.js"]
+CMD ["python", "server.py"]
