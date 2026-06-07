@@ -2,6 +2,7 @@ import os
 import random
 import logging
 from fnmatch import fnmatch
+from contextvars import ContextVar
 
 import httpx
 from fastmcp import FastMCP
@@ -9,11 +10,57 @@ from fastmcp.server.auth.providers.google import GoogleProvider
 from fastmcp.server.auth import AccessToken
 from fastmcp.server.dependencies import CurrentAccessToken
 from fastmcp.utilities.authorization import AuthContext
+from mcp.server.auth.provider import OAuthClientInformationFull, AuthorizationCode
+from mcp.shared.auth import OAuthToken
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
-auth = GoogleProvider(
+
+# ── Custom GoogleProvider that embeds MCP client_id in token claims ──
+
+# Thread-local storage for the current MCP client during token exchange
+_current_mcp_client: ContextVar[OAuthClientInformationFull | None] = ContextVar(
+    "_current_mcp_client", default=None
+)
+
+
+class GoogleProviderWithClientId(GoogleProvider):
+    """Extends GoogleProvider to embed the MCP client_id in upstream_claims.
+
+    By default, the token's client_id is set to the Google user sub.
+    This override ensures the DCR/CIMD client_id (which identifies the
+    MCP client app, not the user) is available in token.claims["upstream_claims"].
+    """
+
+    async def exchange_authorization_code(
+        self,
+        client: OAuthClientInformationFull,
+        authorization_code: AuthorizationCode,
+    ) -> OAuthToken:
+        _current_mcp_client.set(client)
+        try:
+            return await super().exchange_authorization_code(client, authorization_code)
+        finally:
+            _current_mcp_client.set(None)
+
+    async def _extract_upstream_claims(
+        self, idp_tokens: dict
+    ) -> dict | None:
+        claims = await super()._extract_upstream_claims(idp_tokens) or {}
+        client = _current_mcp_client.get()
+        if client:
+            claims["mcp_client_id"] = client.client_id
+            claims["mcp_client_name"] = client.client_name
+            claims["mcp_redirect_uris"] = [
+                str(u) for u in (client.redirect_uris or [])
+            ]
+        return claims or None
+
+
+# ── Server setup ────────────────────────────────────────────────
+
+auth = GoogleProviderWithClientId(
     client_id=os.environ["GOOGLE_CLIENT_ID"],
     client_secret=os.environ["GOOGLE_CLIENT_SECRET"],
     base_url=os.environ["BASE_URL"],
@@ -34,27 +81,30 @@ mcp = FastMCP("CIMD Test Server", auth=auth)
 
 # ── Client allow list & per-client tool visibility ──────────────
 #
-# Each entry maps a client_id pattern (supports wildcards via fnmatch)
-# to the list of tools that client can see. Use ["*"] to grant access
-# to all tools.
+# Each entry maps an MCP client_id pattern (supports wildcards) to the
+# list of tools that client can see. Use ["*"] for all tools.
 #
-# Clients not matching any pattern are denied access to ALL tools.
+# The MCP client_id is available in token.claims["upstream_claims"]["mcp_client_id"].
+# For CIMD clients it's the metadata URL; for DCR clients it's the registered ID.
 #
-# The client_id comes from the OAuth token:
-# - CIMD clients: the HTTPS metadata URL (e.g. https://example.com/client.json)
-# - DCR clients: the registered client_id (often the upstream OAuth client_id)
-# - ChatGPT: typically the redirect_uri origin or the upstream client_id
+# Clients not matching any pattern are denied ALL tools.
 
 CLIENT_POLICIES: dict[str, list[str]] = {
     # Example: connector1 gets all tools
-    # "https://chatgpt.com/connector/oauth/CONNECTOR1_ID": ["*"],
+    # "https://chatgpt.com/connector/oauth/ABC123": ["*"],
     #
     # Example: connector2 gets only fun tools
-    # "https://chatgpt.com/connector/oauth/CONNECTOR2_ID": ["magic_8_ball", "dad_joke", "coin_flip"],
+    # "https://chatgpt.com/connector/oauth/DEF456": ["magic_8_ball", "dad_joke"],
     #
-    # Wildcard: allow all clients (remove this once you configure specific clients)
+    # Wildcard: allow all clients (remove once you configure specific clients)
     "*": ["*"],
 }
+
+
+def _get_mcp_client_id(token: AccessToken) -> str:
+    """Extract the MCP client_id from the token's upstream claims."""
+    upstream = (token.claims or {}).get("upstream_claims") or {}
+    return upstream.get("mcp_client_id") or token.client_id
 
 
 def _get_allowed_tools(client_id: str) -> list[str] | None:
@@ -68,14 +118,14 @@ def _get_allowed_tools(client_id: str) -> list[str] | None:
 def client_access(ctx: AuthContext) -> bool:
     """AuthCheck: enforces client allow list and per-client tool visibility.
 
-    - If the client is not in CLIENT_POLICIES, deny access (tool is hidden).
+    - If the client is not in CLIENT_POLICIES, deny (tool is hidden).
     - If the client's tool list is ["*"], allow all tools.
-    - Otherwise, only allow if this specific tool is in the client's list.
+    - Otherwise, only allow if the specific tool is in the client's list.
     """
     if ctx.token is None:
         return False
 
-    client_id = ctx.token.client_id
+    client_id = _get_mcp_client_id(ctx.token)
     allowed_tools = _get_allowed_tools(client_id)
 
     if allowed_tools is None:
@@ -89,7 +139,7 @@ def client_access(ctx: AuthContext) -> bool:
     if tool_name and tool_name in allowed_tools:
         return True
 
-    logger.info("Client %s denied access to tool %s", client_id, tool_name)
+    logger.debug("Client %s denied access to tool %s", client_id, tool_name)
     return False
 
 
@@ -117,23 +167,24 @@ async def whoami(token: AccessToken = CurrentAccessToken()) -> str:
 
 @mcp.tool(auth=client_access)
 async def what_client(token: AccessToken = CurrentAccessToken()) -> str:
-    """Identifies which MCP client is connecting — shows client_id, claims, and CIMD metadata."""
+    """Identifies which MCP client is connecting — shows MCP client_id and metadata."""
+    import json
     claims = token.claims or {}
+    upstream = claims.get("upstream_claims") or {}
+
     lines = [
-        f"Client ID: {token.client_id}",
+        "=== MCP CLIENT ===",
+        f"MCP Client ID: {upstream.get('mcp_client_id', 'N/A')}",
+        f"MCP Client Name: {upstream.get('mcp_client_name', 'N/A')}",
+        f"MCP Redirect URIs: {upstream.get('mcp_redirect_uris', [])}",
+        "",
+        "=== GOOGLE USER ===",
+        f"Google Sub: {token.client_id}",
         f"Scopes: {', '.join(token.scopes)}",
-        f"Subject: {token.subject or 'N/A'}",
+        "",
+        "=== ALL CLAIMS ===",
+        json.dumps(claims, indent=2, default=str),
     ]
-
-    # Show CIMD metadata if available
-    client_name = claims.get("client_name")
-    if client_name:
-        lines.append(f"Client Name (CIMD): {client_name}")
-        lines.append(f"Client URI: {claims.get('client_uri', 'N/A')}")
-
-    # Show all claims for debugging
-    lines.append(f"Token claims keys: {list(claims.keys())}")
-
     return "\n".join(lines)
 
 
