@@ -93,8 +93,10 @@ CLIENT_POLICIES: dict[str, list[str]] = {
     # ChatGPT connector1 — full access
     "https://chatgpt.com/connector/oauth/FybmP8uyDtas": ["*"],
 
-    # Example: another connector with limited access
-    # "https://chatgpt.com/connector/oauth/ANOTHER_ID": ["dad_joke", "coin_flip"],
+    # ChatGPT connector2 — no dad_joke
+    "https://chatgpt.com/connector/oauth/ozgl9jk8h2eW": [
+        "whoami", "what_client", "magic_8_ball", "coin_flip", "mood_color",
+    ],
 
     # Claude
     "https://claude.ai/*": ["*"],
