@@ -90,14 +90,18 @@ mcp = FastMCP("CIMD Test Server", auth=auth)
 # Clients not matching any pattern are denied ALL tools.
 
 CLIENT_POLICIES: dict[str, list[str]] = {
-    # Example: connector1 gets all tools
-    # "https://chatgpt.com/connector/oauth/ABC123": ["*"],
-    #
-    # Example: connector2 gets only fun tools
-    # "https://chatgpt.com/connector/oauth/DEF456": ["magic_8_ball", "dad_joke"],
-    #
-    # Wildcard: allow all clients (remove once you configure specific clients)
-    "*": ["*"],
+    # ChatGPT connector1 — full access
+    "https://chatgpt.com/connector/oauth/FybmP8uyDtas": ["*"],
+
+    # Example: another connector with limited access
+    # "https://chatgpt.com/connector/oauth/ANOTHER_ID": ["dad_joke", "coin_flip"],
+
+    # Claude
+    "https://claude.ai/*": ["*"],
+
+    # Local development
+    "http://localhost:*/*": ["*"],
+    "http://127.0.0.1:*/*": ["*"],
 }
 
 
@@ -107,11 +111,23 @@ def _get_mcp_client_id(token: AccessToken) -> str:
     return upstream.get("mcp_client_id") or token.client_id
 
 
-def _get_allowed_tools(client_id: str) -> list[str] | None:
-    """Return the tool allow list for a client, or None if not in allow list."""
+def _get_allowed_tools(token: AccessToken) -> list[str] | None:
+    """Return the tool allow list for a client, or None if not in allow list.
+
+    Matches against MCP client_id AND redirect URIs, since the client_id
+    is a random UUID from DCR (not stable), while redirect URIs are stable.
+    """
+    upstream = (token.claims or {}).get("upstream_claims") or {}
+    identifiers = [
+        upstream.get("mcp_client_id", ""),
+        *(upstream.get("mcp_redirect_uris") or []),
+        token.client_id,
+    ]
+
     for pattern, tools in CLIENT_POLICIES.items():
-        if fnmatch(client_id, pattern):
-            return tools
+        for identifier in identifiers:
+            if identifier and fnmatch(identifier, pattern):
+                return tools
     return None
 
 
@@ -125,11 +141,10 @@ def client_access(ctx: AuthContext) -> bool:
     if ctx.token is None:
         return False
 
-    client_id = _get_mcp_client_id(ctx.token)
-    allowed_tools = _get_allowed_tools(client_id)
+    allowed_tools = _get_allowed_tools(ctx.token)
 
     if allowed_tools is None:
-        logger.info("Client %s not in allow list — denied", client_id)
+        logger.info("Client %s not in allow list — denied", _get_mcp_client_id(ctx.token))
         return False
 
     if "*" in allowed_tools:
